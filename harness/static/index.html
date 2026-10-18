@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dark Factory — Bug Resolution Line</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>DARK FACTORY <span class="sub">bug resolution line · unattended</span></h1>
+  </div>
+  <div class="controls">
+    <button id="runAll">▶ Run line</button>
+    <button id="reset" class="ghost">reset</button>
+  </div>
+</header>
+
+<main>
+  <section class="lanes">
+    <div class="lane-header">
+      <span>bug</span>
+      <span>intake</span>
+      <span>qualify</span>
+      <span>black box</span>
+      <span>oracle</span>
+      <span>diff inspect</span>
+      <span>deploy</span>
+      <span>outcome</span>
+    </div>
+    <div id="lanes"></div>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>audit chain</h2>
+      <div class="hint">hash-chained, append-only, replayable</div>
+      <pre id="audit"></pre>
+    </div>
+    <div class="panel">
+      <h2>escalations</h2>
+      <div class="hint">bugs the line refused to ship — handed to a human</div>
+      <div id="escal"></div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  trust lives in the interlocks, not in the arm · <span id="ticker">waiting for intake</span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

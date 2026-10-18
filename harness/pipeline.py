@@ -1,0 +1,324 @@
+"""The confidence layer. Pre-checks → black box → post-checks → gated deploy → audit."""
+from __future__ import annotations
+import hashlib, json, os, re, shutil, subprocess, sys, time, uuid
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Callable, Optional
+
+from fixer import get_patch
+
+HARNESS = Path(__file__).resolve().parent
+REPO = HARNESS.parent / "sample_repo"
+SCRATCH = HARNESS / "_scratch"
+DEPLOYED = HARNESS / "deployed"
+AUDIT = HARNESS / "audit" / "audit.log"
+ESCALATIONS = HARNESS / "escalations"
+
+PROTECTED_PATHS = {"protected/"}
+BANNED_IMPORTS = {"subprocess", "socket", "ctypes"}
+SECRET_PATTERNS = [re.compile(r"(?i)(api[_-]?key|secret|password)\s*=\s*['\"]")]
+MAX_PATCH_LINES = 15
+
+# Bugs the pre-check qualifier recognises as 'trivial' with an auto-generable
+# reproducing test. BUG_D is deliberately NOT here.
+TRIVIAL_ALLOWLIST = {"BUG_A", "BUG_B", "BUG_C", "BUG_E"}
+
+REPRO_TESTS = {
+    "BUG_A": ("test_calculator.py", "def test_repro_bug_a():\n    from calculator import sum_range\n    assert sum_range(5) == 15\n"),
+    "BUG_B": ("test_calculator.py", "def test_repro_bug_b():\n    from calculator import is_even\n    assert is_even(4) is True\n"),
+    "BUG_C": ("test_calculator.py", "def test_repro_bug_c():\n    from calculator import safe_len\n    assert safe_len(None) == 0\n"),
+    "BUG_E": ("test_calculator.py", "def test_repro_bug_e():\n    from calculator import sum_range\n    assert sum_range(0) == 0\n"),
+}
+
+
+@dataclass
+class StageResult:
+    name: str
+    status: str  # "pass" | "fail" | "skip"
+    detail: str = ""
+    data: dict = field(default_factory=dict)
+
+
+# ---------- audit (hash-chained) ----------
+
+def _last_hash() -> str:
+    if not AUDIT.exists():
+        return "GENESIS"
+    last = ""
+    for line in AUDIT.read_text().splitlines():
+        if line.strip():
+            last = line
+    if not last:
+        return "GENESIS"
+    return json.loads(last)["hash"]
+
+
+def audit_append(bug_id: str, event: str, payload: dict) -> dict:
+    AUDIT.parent.mkdir(parents=True, exist_ok=True)
+    prev = _last_hash()
+    body = {
+        "ts": time.time(),
+        "bug_id": bug_id,
+        "event": event,
+        "payload": payload,
+        "prev": prev,
+    }
+    body["hash"] = hashlib.sha256(
+        (prev + json.dumps(body, sort_keys=True, default=str)).encode()
+    ).hexdigest()[:16]
+    with AUDIT.open("a") as f:
+        f.write(json.dumps(body, default=str) + "\n")
+    return body
+
+
+# ---------- pipeline stages ----------
+
+def stage_intake(bug) -> StageResult:
+    return StageResult("intake", "pass", f"received {bug['id']}: {bug['title']}")
+
+
+def stage_qualify(bug) -> StageResult:
+    bid = bug["id"]
+    if bid not in TRIVIAL_ALLOWLIST:
+        return StageResult(
+            "qualify", "fail",
+            "not in trivial allowlist — no auto-generable reproducing test, "
+            "spec is ambiguous. Escalating.",
+        )
+    return StageResult("qualify", "pass", f"{bid} matches trivial shape; reproducing test available")
+
+
+def stage_blackbox(bug) -> StageResult:
+    patch = get_patch(bug["id"])
+    if patch is None:
+        return StageResult("blackbox", "fail", "fixer returned no patch")
+    return StageResult(
+        "blackbox", "pass",
+        f"fixer returned patch touching {len(patch)} file(s)",
+        {"files": list(patch.keys()), "patch": patch},
+    )
+
+
+def _prepare_scratch(patch: dict) -> Path:
+    if SCRATCH.exists():
+        shutil.rmtree(SCRATCH)
+    shutil.copytree(REPO, SCRATCH)
+    for rel, contents in patch.items():
+        p = SCRATCH / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(contents)
+    return SCRATCH
+
+
+def _inject_repro(bug_id: str, scratch: Path):
+    if bug_id in REPRO_TESTS:
+        rel, body = REPRO_TESTS[bug_id]
+        tf = scratch / "tests" / rel
+        tf.write_text(tf.read_text() + "\n" + body)
+
+
+def _run_pytest(cwd: Path, extra_args: list[str] | None = None) -> tuple[bool, str, dict]:
+    """Run pytest, return (ok, tail, result_map). result_map: {nodeid: 'passed'|'failed'}."""
+    try:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(cwd)
+        args = [sys.executable, "-m", "pytest", "-v", "--rootdir", str(cwd), "tests"]
+        if extra_args:
+            args += extra_args
+        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=30, env=env)
+        out = (r.stdout + r.stderr)
+        result_map = {}
+        for line in out.splitlines():
+            # pytest -v lines look like:  tests/test_calculator.py::test_x PASSED  [ 10%]
+            m = re.match(r"(tests/\S+::\S+)\s+(PASSED|FAILED|ERROR)", line)
+            if m:
+                result_map[m.group(1)] = m.group(2).lower()
+        return r.returncode == 0, out[-2000:], result_map
+    except Exception as e:
+        return False, f"pytest crashed: {e}", {}
+
+
+def _baseline_results() -> dict:
+    """Which tests pass on the un-patched repo? Cached once."""
+    global _BASELINE
+    try:
+        return _BASELINE  # type: ignore
+    except NameError:
+        pass
+    scratch = HARNESS / "_baseline"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    shutil.copytree(REPO, scratch)
+    _, _, rmap = _run_pytest(scratch)
+    globals()["_BASELINE"] = rmap
+    return rmap
+
+
+def stage_oracle(bug, patch) -> StageResult:
+    """Oracle: (1) reproducing test flips red→green, (2) tests that were green
+    on the baseline stay green. Other pre-existing failures are ignored —
+    they belong to other bugs on the backlog."""
+    baseline = _baseline_results()
+    scratch = _prepare_scratch(patch)
+    _inject_repro(bug["id"], scratch)
+    _, out, rmap = _run_pytest(scratch)
+
+    repro_id = next((k for k in rmap if k.endswith(f"test_repro_{bug['id'].lower()}")), None)
+    repro_ok = repro_id is not None and rmap.get(repro_id) == "passed"
+
+    regressions = [
+        nid for nid, status in rmap.items()
+        if baseline.get(nid) == "passed" and status != "passed"
+    ]
+
+    if not repro_ok:
+        return StageResult("oracle", "fail", "reproducing test did not go red→green",
+                           {"pytest_tail": out[-800:]})
+    if regressions:
+        return StageResult("oracle", "fail",
+                           f"regressions introduced: {', '.join(regressions)}",
+                           {"pytest_tail": out[-800:]})
+    return StageResult("oracle", "pass",
+                       "repro flipped red→green, no regressions",
+                       {"repro": repro_id, "pytest_tail": out[-400:]})
+
+
+def _diff_lines(patch: dict) -> int:
+    total = 0
+    for rel, new in patch.items():
+        old = (REPO / rel).read_text() if (REPO / rel).exists() else ""
+        # cheap line-count delta
+        total += abs(len(new.splitlines()) - len(old.splitlines())) + sum(
+            1 for a, b in zip(new.splitlines(), old.splitlines()) if a != b
+        )
+    return total
+
+
+def stage_diff_inspect(bug, patch) -> StageResult:
+    findings = []
+    # protected paths
+    for rel in patch:
+        for prot in PROTECTED_PATHS:
+            if rel.startswith(prot):
+                findings.append(f"touches protected path: {rel}")
+    # banned imports / secrets
+    for rel, new in patch.items():
+        for mod in BANNED_IMPORTS:
+            if re.search(rf"^\s*import\s+{mod}\b", new, re.M) or re.search(rf"^\s*from\s+{mod}\b", new, re.M):
+                findings.append(f"banned import '{mod}' in {rel}")
+        for pat in SECRET_PATTERNS:
+            if pat.search(new):
+                findings.append(f"possible secret literal in {rel}")
+    # size
+    size = _diff_lines(patch)
+    if size > MAX_PATCH_LINES:
+        findings.append(f"patch too large: {size} line-deltas > {MAX_PATCH_LINES}")
+
+    if findings:
+        return StageResult("diff_inspect", "fail", "; ".join(findings), {"size": size, "findings": findings})
+    return StageResult("diff_inspect", "pass", f"clean, {size} line-deltas", {"size": size})
+
+
+def stage_deploy(bug, patch) -> StageResult:
+    # 'canary' = re-run tests from the deployed dir
+    if DEPLOYED.exists():
+        shutil.rmtree(DEPLOYED)
+    shutil.copytree(REPO, DEPLOYED)
+    for rel, contents in patch.items():
+        p = DEPLOYED / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(contents)
+    _inject_repro(bug["id"], DEPLOYED)
+    _, out, rmap = _run_pytest(DEPLOYED)
+    baseline = _baseline_results()
+    repro_id = next((k for k in rmap if k.endswith(f"test_repro_{bug['id'].lower()}")), None)
+    regressions = [n for n, s in rmap.items() if baseline.get(n) == "passed" and s != "passed"]
+    ok = repro_id and rmap.get(repro_id) == "passed" and not regressions
+    if not ok:
+        # auto-rollback
+        shutil.rmtree(DEPLOYED)
+        shutil.copytree(REPO, DEPLOYED)
+        return StageResult("deploy", "fail", "canary failed — auto-rolled back", {"pytest_tail": out})
+    return StageResult("deploy", "pass", "canary green, flag flipped", {"flag": f"fix_{bug['id'].lower()}"})
+
+
+def escalate(bug, reason: str, trace: list):
+    ESCALATIONS.mkdir(parents=True, exist_ok=True)
+    f = ESCALATIONS / f"{bug['id']}_{uuid.uuid4().hex[:6]}.json"
+    f.write_text(json.dumps({"bug": bug, "reason": reason, "trace": trace}, indent=2, default=str))
+    return str(f.name)
+
+
+# ---------- orchestrator (generator so UI can stream) ----------
+
+def run_pipeline(bug, emit: Callable[[dict], None]):
+    """Drive one bug through the line. `emit` publishes to the SSE stream."""
+    trace: list[dict] = []
+    patch: Optional[dict] = None
+
+    def push(stage: StageResult):
+        rec = {"bug_id": bug["id"], "stage": stage.name, "status": stage.status,
+               "detail": stage.detail, "data": stage.data}
+        trace.append(rec)
+        audit_append(bug["id"], f"stage:{stage.name}", {"status": stage.status, "detail": stage.detail})
+        emit(rec)
+        time.sleep(0.35)  # dramatic pacing for the demo
+
+    # 1. intake
+    push(stage_intake(bug))
+
+    # 2. qualify
+    q = stage_qualify(bug)
+    push(q)
+    if q.status != "pass":
+        name = escalate(bug, q.detail, trace)
+        emit({"bug_id": bug["id"], "stage": "escalate", "status": "escalated",
+              "detail": f"handed to human → {name}"})
+        audit_append(bug["id"], "escalated", {"reason": q.detail, "file": name})
+        return
+
+    # 3. black box
+    b = stage_blackbox(bug)
+    push(b)
+    if b.status != "pass":
+        name = escalate(bug, b.detail, trace)
+        emit({"bug_id": bug["id"], "stage": "escalate", "status": "escalated", "detail": name})
+        return
+    patch = b.data["patch"]
+
+    # 4. oracle
+    o = stage_oracle(bug, patch)
+    push(o)
+    if o.status != "pass":
+        name = escalate(bug, "oracle failed: " + o.detail, trace)
+        emit({"bug_id": bug["id"], "stage": "escalate", "status": "escalated", "detail": name})
+        return
+
+    # 5. diff inspect
+    d = stage_diff_inspect(bug, patch)
+    push(d)
+    if d.status != "pass":
+        name = escalate(bug, "diff rejected: " + d.detail, trace)
+        emit({"bug_id": bug["id"], "stage": "escalate", "status": "escalated", "detail": name})
+        return
+
+    # 6. deploy
+    dep = stage_deploy(bug, patch)
+    push(dep)
+    if dep.status != "pass":
+        name = escalate(bug, "deploy failed: " + dep.detail, trace)
+        emit({"bug_id": bug["id"], "stage": "escalate", "status": "escalated", "detail": name})
+        return
+
+    emit({"bug_id": bug["id"], "stage": "shipped", "status": "shipped",
+          "detail": f"fix for {bug['id']} is live"})
+    audit_append(bug["id"], "shipped", {"flag": dep.data.get("flag")})
+
+
+BUGS = [
+    {"id": "BUG_A", "title": "sum_range off-by-one", "file": "calculator.py"},
+    {"id": "BUG_B", "title": "is_even wrong operator", "file": "calculator.py"},
+    {"id": "BUG_C", "title": "safe_len crashes on None", "file": "calculator.py"},
+    {"id": "BUG_E", "title": "sum_range(0) edge case — fix tries to touch protected billing module", "file": "calculator.py"},
+    {"id": "BUG_D", "title": "discount_price gives wrong total for 10% off", "file": "calculator.py"},
+]
