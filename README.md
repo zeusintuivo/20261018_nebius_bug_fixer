@@ -50,9 +50,11 @@ Moving beyond simple LLM code generation, BugSmasher establishes an industrial "
 Before installing BugSmasher, ensure your system meets the following requirements:
 
 * **OS**: Linux, macOS, or Windows (WSL2 recommended)
-* **Python**: `3.10` or higher
+* **Python**: `3.10` or higher (the installer auto-selects `python3.10`–`python3.14`)
 * **Git**: `2.30+` installed and available in `PATH`
-* **Virtual Environment**: `venv` or `conda`
+* **Shell**: `bash` 4+ (ships with Linux, macOS, and WSL2)
+
+The installer provisions its own virtualenv in `.venv/` — you do not need `conda`.
 
 ---
 
@@ -65,81 +67,86 @@ git clone https://github.com/your-org/bugsmasher.git
 cd bugsmasher
 ```
 
-### 2. Set Up Virtual Environment
+### 2. Run the installer
 
 ```bash
-# Using venv
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+bash install.bash
 ```
 
-### 3. Install Dependencies
+`install.bash` is idempotent and fails fast:
+
+1. Picks the newest Python ≥ 3.10 on your `PATH`.
+2. Creates `.venv/` in the repo root (reuses it on subsequent runs).
+3. Upgrades `pip`, `setuptools`, `wheel`.
+4. Installs required deps: `fastapi`, `uvicorn`, `python-dotenv`, `pytest`, `httpx`.
+5. Installs optional LLM backends: `openai` (for Nebius), `google-genai` (for Gemini).
+6. Verifies every required import before exiting.
+
+Useful flags:
 
 ```bash
-# Upgrade pip and core setuptools
-pip install --upgrade pip setuptools build
-
-# Install BugSmasher dependencies
-pip install -r requirements.txt
-
-# (Optional) Install in editable mode for development
-pip install -e .
+bash install.bash --no-optional   # skip openai + google-genai (offline fixer only)
+bash install.bash --recreate      # wipe .venv and start fresh
 ```
+
+If any step fails the installer stops with a red `[install:FAIL]` line — fix the cause and re-run.
 
 ---
 
 ## ⚙️ Configuration
 
-BugSmasher relies on an environment file to manage security thresholds and local target paths. Create a `.env` file in the root directory:
+The LLM-backed fixers (`nebius`, `gemini`) read credentials from a `.env` at the repo root. The `offline` fixer needs no configuration.
 
-```bash
-cp .env.example .env
-```
-
-Edit your `.env` configuration:
+Example `.env`:
 
 ```env
-# BugSmasher Configuration
-BS_LOG_LEVEL=INFO
-BS_ENABLE_AUDIT_LEDGER=true
-BS_AUDIT_LEDGER_PATH=./audit_ledger.json
-BS_SAFETY_THRESHOLD=0.95
+# Nebius (OpenAI-compatible endpoint)
+NEBIUS_API_KEY=sk-...
+NEBIUS_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
 
-# Optional LLM / Analysis Backend Keys
-BS_MODEL_PROVIDER=local
+# Gemini (optional)
+# GEMINI_API_KEY=...
+# GEMINI_MODEL=gemini-2.0-flash
 ```
+
+Missing keys do not break startup — the UI simply greys-out the unconfigured fixer via `/api/fixers`.
 
 ---
 
 ## 💻 Usage
 
-BugSmasher inspects and processes target repositories from a local directory path.
-
-### Analyzing a Local Repository
-
-Run a dry-run analysis on a local repository without applying changes:
+### Launch the harness
 
 ```bash
-bugsmasher analyze --repo-path /path/to/target-local-repo --dry-run
+bash run.bash                 # default: http://127.0.0.1:8099
+PORT=8080 bash run.bash       # pick another port
+LOG_LEVEL=info bash run.bash  # uvicorn log level
 ```
 
-### Running the Autonomous Resolution Pipeline
+`run.bash` auto-runs `install.bash` the first time, then verifies the venv, checks that the port is free, and `exec`s uvicorn with `harness/server:app`.
 
-Execute the full pipeline (Prequalification → Test Oracle → Security Gate → Audit Signing):
+Open `http://127.0.0.1:8099/` for the SAP Fiori dashboard.
+
+### Key endpoints
+
+| Endpoint                        | Purpose                                              |
+|---------------------------------|------------------------------------------------------|
+| `GET  /api/bugs`                | List seeded bugs                                     |
+| `POST /api/run/{bug_id}`        | Run the pipeline for one bug (`?fixer=offline\|nebius\|gemini`) |
+| `POST /api/run_all`             | Run every bug sequentially                           |
+| `GET  /api/stream`              | SSE stream of pipeline progress                      |
+| `GET  /api/audit`               | Full hash-chained + HMAC-signed audit log            |
+| `GET  /api/audit/verify`        | Re-walks the chain, proves no tampering              |
+| `GET  /api/audit/replay/{bug}`  | Every audit event for one bug                        |
+| `GET  /api/escalations`         | Inbox of bugs handed back to a human                 |
+| `POST /api/pause` / `/api/resume` | Human-on-the-loop line control                     |
+| `POST /api/reset`               | Wipe audit + escalations (demo convenience)          |
+
+### Running the test suite
 
 ```bash
-bugsmasher execute --repo-path /path/to/target-local-repo
+.venv/bin/pytest sample_repo/tests -v
 ```
-
-### Launching the SAP Fiori Enterprise Dashboard
-
-To view audit ledgers, system status, and confidence metrics:
-
-```bash
-bugsmasher dashboard --port 8080
-```
-
-Open your browser and navigate to `http://localhost:8080` to access the SAP Fiori cockpit interface.
 
 ---
 
