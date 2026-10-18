@@ -1,82 +1,34 @@
-"""The BLACK BOX.
+"""Backward-compat shim.
 
-Clean interface the confidence layer calls. Returns a unified-diff-ish patch
-(list of (file, new_contents)) given a bug id. In production this is swapped
-for an LLM agent, Claude, a multi-agent factory, whatever. The confidence
-layer does not care and does not look inside.
-
-For the hackathon demo the 'agent' is a lookup table — because judging the
-arm is explicitly out of scope per the brief. All trust comes from the
-interlocks around it.
+The real fixers live in fixers/*. This module keeps the pipeline tidy and
+provides a single entry point `get_patch(bug_id_or_report, fixer=None)`.
 """
-from pathlib import Path
+from __future__ import annotations
+from typing import Optional, Union
 
-REPO = Path(__file__).resolve().parent.parent / "sample_repo"
-
-
-def _read(rel):
-    return (REPO / rel).read_text()
+from fixers import get as _get_fixer, available as _available
+from fixers.base import BugReport, Patch
 
 
-# Each entry: bug_id -> {file -> new_contents}
-_PATCHES = {
-    "BUG_A": {
-        "calculator.py": _read("calculator.py").replace(
-            "    for i in range(1, n):",
-            "    for i in range(1, n + 1):",
-        ),
-    },
-    "BUG_B": {
-        "calculator.py": _read("calculator.py").replace(
-            "    return x % 2 == 1",
-            "    return x % 2 == 0",
-        ),
-    },
-    "BUG_C": {
-        "calculator.py": _read("calculator.py").replace(
-            "def safe_len(xs):\n    # BUG C (trivial): missing None guard\n    return len(xs)",
-            "def safe_len(xs):\n    # BUG C (trivial): missing None guard\n    if xs is None:\n        return 0\n    return len(xs)",
-        ),
-    },
-    # BUG E: the fixer "fixes" sum_range(0) but ALSO silently edits a
-    # protected billing constant it decided was 'related'. Classic agent
-    # overreach. Oracle will go green — but diff inspection must veto.
-    "BUG_E": {
-        "calculator.py": _read("calculator.py").replace(
-            "    for i in range(1, n):",
-            "    if n <= 0:\n        return 0\n    for i in range(1, n + 1):",
-        ),
-        "protected/billing.py": '"""PROTECTED"""\nTAX_RATE = 0.17  # agent decided this needed updating\n',
-    },
-    # BUG D: the "fixer" returns a sprawling rewrite that also tries to
-    # modify a protected file. Diff inspection must reject it.
-    "BUG_D": {
-        "calculator.py": _read("calculator.py").replace(
-            "def discount_price(price, percent):\n"
-            "    # BUG D (nasty): compounding instead of flat, plus unclear negative-input policy.\n"
-            "    # Not auto-fixable with a small localized diff; needs human judgement.\n"
-            "    result = price\n"
-            "    for _ in range(int(percent)):\n"
-            "        result = result - result * 0.01\n"
-            "    return round(result, 2)",
-            "def discount_price(price, percent):\n"
-            "    # 'fixed' — but sprawling, speculative, touches policy\n"
-            "    import os  # new dependency on stdlib io\n"
-            "    if percent < 0:\n"
-            "        percent = abs(percent)\n"
-            "    if percent > 100:\n"
-            "        percent = 100\n"
-            "    discount = price * (percent / 100.0)\n"
-            "    result = price - discount\n"
-            "    if os.environ.get('DOUBLE_DISCOUNT'):\n"
-            "        result = result - discount\n"
-            "    return round(result, 2)",
-        ),
-        "protected/billing.py": '"""PROTECTED"""\nTAX_RATE = 0.21\n',  # <-- touches protected
-    },
-}
+def _coerce(b: Union[dict, BugReport]) -> BugReport:
+    if isinstance(b, BugReport):
+        return b
+    return BugReport(
+        id=b["id"],
+        title=b.get("title", ""),
+        file=b.get("file", ""),
+        symptom=b.get("symptom", ""),
+    )
 
 
-def get_patch(bug_id: str):
-    """Return {relative_path: new_contents} or None if the box has no idea."""
-    return _PATCHES.get(bug_id)
+def get_patch(bug: Union[dict, BugReport, str],
+              fixer: Optional[str] = None) -> Optional[Patch]:
+    # legacy call site passed just the bug id; wrap minimally
+    if isinstance(bug, str):
+        bug = BugReport(id=bug, title="", file="", symptom="")
+    report = _coerce(bug)
+    return _get_fixer(fixer).get_patch(report)
+
+
+def available() -> list[dict]:
+    return _available()

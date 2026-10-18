@@ -4,21 +4,19 @@
 def sum_range(n):
     # BUG A (trivial): off-by-one — should be range(1, n+1)
     total = 0
-    for i in range(1, n):
+    for i in range(1, n + 1):
         total += i
     return total
 
 
 def is_even(x):
     # BUG B (trivial): wrong operator — should be == 0
-    return x % 2 == 1
+    return x % 2 == 0
 
 
 def safe_len(xs):
     # BUG C (trivial): missing None guard
-    if xs is None:
-        return 0
-    return len(xs)
+    return len(xs) if xs is not None else 0
 
 
 def discount_price(price, percent):

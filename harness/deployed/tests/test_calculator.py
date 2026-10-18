@@ -35,6 +35,6 @@ def test_discount_price_ten():
     # Business spec: flat 10% off => 90.00
     assert discount_price(100, 10) == 90.00
 
-def test_repro_bug_c():
-    from calculator import safe_len
-    assert safe_len(None) == 0
+def test_repro_bug_e():
+    from calculator import sum_range
+    assert sum_range(0) == 0

@@ -1,0 +1,32 @@
+{
+  "bug": {
+    "id": "BUG_D",
+    "title": "discount_price wrong for simple percentages",
+    "file": "calculator.py",
+    "severity": "nasty",
+    "symptom": "discount_price(100,10) does not return 90.00; semantics around negative/>100 percent unspecified."
+  },
+  "reason": "not in trivial allowlist \u2014 no auto-generable reproducing test; spec is ambiguous. Escalating to a human.",
+  "code": "NOT_TRIVIAL",
+  "trace": [
+    {
+      "bug_id": "BUG_D",
+      "stage": "intake",
+      "status": "pass",
+      "code": "OK",
+      "detail": "received BUG_D: discount_price wrong for simple percentages",
+      "data": {},
+      "fixer": "nebius"
+    },
+    {
+      "bug_id": "BUG_D",
+      "stage": "qualify",
+      "status": "fail",
+      "code": "NOT_TRIVIAL",
+      "detail": "not in trivial allowlist \u2014 no auto-generable reproducing test; spec is ambiguous. Escalating to a human.",
+      "data": {},
+      "fixer": "nebius"
+    }
+  ],
+  "ts": 1792339395.004181
+}

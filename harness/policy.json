@@ -1,0 +1,17 @@
+{
+  "_comment": "The interlocks are configuration, not code. Edit this file to change what the dark factory will and will not ship. The pipeline reloads policy on every run.",
+  "version": "1.0.0",
+  "trivial_allowlist": ["BUG_A", "BUG_B", "BUG_C", "BUG_E"],
+  "protected_paths": ["protected/"],
+  "banned_imports": ["subprocess", "socket", "ctypes"],
+  "secret_patterns": ["(?i)(api[_-]?key|secret|password)\\s*=\\s*['\\\"]"],
+  "max_patch_line_deltas": 15,
+  "deploy": {
+    "canary_slo_error_rate": 0.0,
+    "flag_prefix": "fix_"
+  },
+  "audit": {
+    "hmac_secret_env": "DARKFACTORY_AUDIT_SECRET",
+    "hmac_secret_default": "demo-key-rotate-in-prod"
+  }
+}
