@@ -26,7 +26,10 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from pipeline import (
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from pipeline import (  # noqa: E402
     run_pipeline, BUGS, AUDIT, ESCALATIONS,
     verify_audit, replay, metrics, load_policy,
     pause_line, resume_line, line_status,
